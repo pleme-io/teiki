@@ -10,7 +10,7 @@ use tracing::{error, info};
 
 /// Minimal spec for task execution — only what the runner needs.
 /// Separates execution concerns from scheduling/platform/metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecSpec {
     pub command: String,
     pub args: Vec<String>,
@@ -46,7 +46,7 @@ pub trait TaskRunner: Send + Sync {
 
 // ── Notification resolution ────────────────────────────────────
 
-/// Resolves a notifier for a given webhook URL. Trait-based for mockability.
+/// Resolves notifications for a given webhook URL. Trait-based for mockability.
 pub trait NotifierFactory: Send + Sync {
     fn notify(
         &self,
@@ -57,10 +57,12 @@ pub trait NotifierFactory: Send + Sync {
 }
 
 /// HTTP webhook notifier factory. Reuses a single `reqwest::Client` (connection pool).
+#[cfg(feature = "webhooks")]
 pub struct HttpNotifierFactory {
     client: reqwest::Client,
 }
 
+#[cfg(feature = "webhooks")]
 impl HttpNotifierFactory {
     #[must_use]
     pub fn new() -> Self {
@@ -68,12 +70,14 @@ impl HttpNotifierFactory {
     }
 }
 
+#[cfg(feature = "webhooks")]
 impl Default for HttpNotifierFactory {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "webhooks")]
 impl NotifierFactory for HttpNotifierFactory {
     async fn notify(&self, url: &str, task_name: &str, exit_code: i32) {
         let body = serde_json::json!({
@@ -83,7 +87,7 @@ impl NotifierFactory for HttpNotifierFactory {
     }
 }
 
-/// No-op factory for tasks without webhooks or for testing.
+/// No-op factory — no notifications. Default for most usage.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoopNotifierFactory;
 
@@ -91,11 +95,14 @@ impl NotifierFactory for NoopNotifierFactory {
     async fn notify(&self, _url: &str, _task_name: &str, _exit_code: i32) {}
 }
 
-// ── Command builder (public for testability) ───────────────────
+// ── Command builder (pure function, no side effects) ───────────
 
 /// Build a `tokio::process::Command` from an `ExecSpec`.
+///
+/// `current_path`: the current PATH value. Pass `None` to read from
+/// the process environment (production), or `Some("...")` for testing.
 #[must_use]
-pub fn build_command(spec: &ExecSpec) -> tokio::process::Command {
+pub fn build_command(spec: &ExecSpec, current_path: Option<&str>) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(&spec.command);
     cmd.args(&spec.args);
 
@@ -104,8 +111,10 @@ pub fn build_command(spec: &ExecSpec) -> tokio::process::Command {
     }
 
     if !spec.extra_path.is_empty() {
-        let current = std::env::var("PATH").unwrap_or_default();
-        let extended = format!("{}:{current}", spec.extra_path.join(":"));
+        let base = current_path
+            .map(String::from)
+            .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+        let extended = format!("{}:{base}", spec.extra_path.join(":"));
         cmd.env("PATH", extended);
     }
 
@@ -116,40 +125,18 @@ pub fn build_command(spec: &ExecSpec) -> tokio::process::Command {
     cmd
 }
 
-// ── Production runner ──────────────────────────────────────────
+// ── Production runner (no generics — pure TaskRunner) ──────────
 
-/// Subprocess runner with configurable notification factory.
-pub struct ProcessRunner<N: NotifierFactory> {
-    notifier: N,
-}
+/// Subprocess runner. Implements `TaskRunner` only — notification
+/// is handled by `App`, not the runner (separation of concerns).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProcessRunner;
 
-impl<N: NotifierFactory> ProcessRunner<N> {
-    pub fn new(notifier: N) -> Self {
-        Self { notifier }
-    }
-
-    /// Run a task and optionally notify on failure.
-    pub async fn run_with_notify(
-        &self,
-        name: &str,
-        task: &TaskConfig,
-    ) -> Result<TaskOutcome, TeikiError> {
-        let spec = ExecSpec::from(task);
-        let outcome = self.run(name, &spec).await?;
-        if !outcome.is_success() {
-            if let Some(url) = &task.notify_on_failure {
-                self.notifier.notify(url, name, outcome.exit_code).await;
-            }
-        }
-        Ok(outcome)
-    }
-}
-
-impl<N: NotifierFactory> TaskRunner for ProcessRunner<N> {
+impl TaskRunner for ProcessRunner {
     async fn run(&self, name: &str, spec: &ExecSpec) -> Result<TaskOutcome, TeikiError> {
         info!(task = name, command = %spec.command, "starting");
         let start = Instant::now();
-        let mut cmd = build_command(spec);
+        let mut cmd = build_command(spec, None);
 
         let status = if spec.timeout_secs > 0 {
             let timeout = std::time::Duration::from_secs(spec.timeout_secs);
@@ -179,63 +166,65 @@ impl<N: NotifierFactory> TaskRunner for ProcessRunner<N> {
     }
 }
 
+// ── Mock types (public — usable by library consumers) ──────────
+
+/// Recording notifier factory for test assertions.
+#[derive(Clone, Default)]
+pub struct RecordingNotifierFactory {
+    pub calls: std::sync::Arc<std::sync::Mutex<Vec<(String, String, i32)>>>,
+}
+
+impl NotifierFactory for RecordingNotifierFactory {
+    async fn notify(&self, url: &str, task_name: &str, exit_code: i32) {
+        self.calls.lock().unwrap().push((
+            url.to_string(),
+            task_name.to_string(),
+            exit_code,
+        ));
+    }
+}
+
+/// Mock runner that records calls and returns predetermined outcomes.
+pub struct MockRunner {
+    pub calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    pub exit_code: i32,
+}
+
+impl MockRunner {
+    #[must_use]
+    pub fn succeeding() -> Self {
+        Self { calls: std::sync::Arc::new(std::sync::Mutex::new(vec![])), exit_code: 0 }
+    }
+
+    #[must_use]
+    pub fn failing(code: i32) -> Self {
+        Self { calls: std::sync::Arc::new(std::sync::Mutex::new(vec![])), exit_code: code }
+    }
+}
+
+impl TaskRunner for MockRunner {
+    async fn run(&self, name: &str, _spec: &ExecSpec) -> Result<TaskOutcome, TeikiError> {
+        self.calls.lock().unwrap().push(name.to_string());
+        if self.exit_code == 0 {
+            Ok(TaskOutcome::success(name, std::time::Duration::from_millis(1)))
+        } else {
+            Ok(TaskOutcome::failure(name, self.exit_code, std::time::Duration::from_millis(1)))
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use super::*;
     use crate::config::tests::sample_task;
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-
-    /// Recording notifier factory for test assertions.
-    #[derive(Clone, Default)]
-    pub struct RecordingNotifierFactory {
-        pub calls: Arc<Mutex<Vec<(String, String, i32)>>>,
-    }
-
-    impl NotifierFactory for RecordingNotifierFactory {
-        async fn notify(&self, url: &str, task_name: &str, exit_code: i32) {
-            self.calls.lock().unwrap().push((
-                url.to_string(),
-                task_name.to_string(),
-                exit_code,
-            ));
-        }
-    }
-
-    /// Mock runner that records calls and returns predetermined outcomes.
-    pub struct MockRunner {
-        pub calls: Arc<Mutex<Vec<String>>>,
-        pub exit_code: i32,
-    }
-
-    impl MockRunner {
-        pub fn succeeding() -> Self {
-            Self { calls: Arc::new(Mutex::new(vec![])), exit_code: 0 }
-        }
-
-        pub fn failing(code: i32) -> Self {
-            Self { calls: Arc::new(Mutex::new(vec![])), exit_code: code }
-        }
-    }
-
-    impl TaskRunner for MockRunner {
-        async fn run(&self, name: &str, _spec: &ExecSpec) -> Result<TaskOutcome, TeikiError> {
-            self.calls.lock().unwrap().push(name.to_string());
-            if self.exit_code == 0 {
-                Ok(TaskOutcome::success(name, Duration::from_millis(1)))
-            } else {
-                Ok(TaskOutcome::failure(name, self.exit_code, Duration::from_millis(1)))
-            }
-        }
-    }
 
     fn echo_spec() -> ExecSpec {
         ExecSpec::from(&sample_task("echo"))
     }
 
-    // ── ExecSpec tests ──────────────────────────────────────────
+    // ── ExecSpec ────────────────────────────────────────────────
 
     #[test]
     fn exec_spec_from_task_config() {
@@ -246,28 +235,44 @@ pub mod tests {
     }
 
     #[test]
-    fn exec_spec_preserves_env() {
+    fn exec_spec_preserves_all_fields() {
         let mut task = sample_task("env");
         task.env.insert("KEY".into(), "VAL".into());
+        task.extra_path = vec!["/opt/bin".into()];
+        task.working_directory = Some(PathBuf::from("/tmp"));
         let spec = ExecSpec::from(&task);
         assert_eq!(spec.env["KEY"], "VAL");
+        assert_eq!(spec.extra_path, vec!["/opt/bin"]);
+        assert_eq!(spec.working_directory, Some(PathBuf::from("/tmp")));
     }
 
-    // ── build_command tests ─────────────────────────────────────
+    #[test]
+    fn exec_spec_eq() {
+        let a = echo_spec();
+        let b = echo_spec();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn exec_spec_ne_on_command() {
+        let a = ExecSpec::from(&sample_task("echo"));
+        let b = ExecSpec::from(&sample_task("cat"));
+        assert_ne!(a, b);
+    }
+
+    // ── build_command (pure function) ───────────────────────────
 
     #[test]
     fn build_command_sets_program() {
-        let spec = echo_spec();
-        let cmd = build_command(&spec);
-        let prog = cmd.as_std().get_program();
-        assert_eq!(prog, "echo");
+        let cmd = build_command(&echo_spec(), Some(""));
+        assert_eq!(cmd.as_std().get_program(), "echo");
     }
 
     #[test]
     fn build_command_with_args() {
         let mut spec = echo_spec();
         spec.args = vec!["hello".into(), "world".into()];
-        let cmd = build_command(&spec);
+        let cmd = build_command(&spec, Some(""));
         let args: Vec<_> = cmd.as_std().get_args().collect();
         assert_eq!(args, &["hello", "world"]);
     }
@@ -276,100 +281,104 @@ pub mod tests {
     fn build_command_with_working_dir() {
         let mut spec = echo_spec();
         spec.working_directory = Some(PathBuf::from("/tmp"));
-        let cmd = build_command(&spec);
+        let cmd = build_command(&spec, Some(""));
         assert_eq!(cmd.as_std().get_current_dir(), Some(std::path::Path::new("/tmp")));
     }
 
-    // ── ProcessRunner tests ──────────────────────────────────────
+    #[test]
+    fn build_command_prepends_extra_path() {
+        let mut spec = echo_spec();
+        spec.extra_path = vec!["/opt/a".into(), "/opt/b".into()];
+        let cmd = build_command(&spec, Some("/usr/bin"));
+        let envs: BTreeMap<_, _> = cmd.as_std().get_envs()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
+            .collect();
+        assert_eq!(envs["PATH"], "/opt/a:/opt/b:/usr/bin");
+    }
+
+    #[test]
+    fn build_command_sets_env_vars() {
+        let mut spec = echo_spec();
+        spec.env.insert("FOO".into(), "bar".into());
+        let cmd = build_command(&spec, Some(""));
+        let envs: BTreeMap<_, _> = cmd.as_std().get_envs()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
+            .collect();
+        assert_eq!(envs["FOO"], "bar");
+    }
+
+    #[test]
+    fn build_command_no_extra_path_no_path_env() {
+        let spec = echo_spec(); // no extra_path
+        let cmd = build_command(&spec, Some("/usr/bin"));
+        let has_path = cmd.as_std().get_envs()
+            .any(|(k, _)| k == "PATH");
+        assert!(!has_path, "should not set PATH when extra_path is empty");
+    }
+
+    // ── ProcessRunner ──────────────────────────────────────────
 
     #[tokio::test]
-    async fn process_runner_executes_echo() {
-        let runner = ProcessRunner::new(NoopNotifierFactory);
-        let spec = echo_spec();
-        let outcome = runner.run("echo-test", &spec).await.unwrap();
+    async fn process_runner_echo() {
+        let outcome = ProcessRunner.run("t", &echo_spec()).await.unwrap();
         assert!(outcome.is_success());
     }
 
     #[tokio::test]
-    async fn process_runner_captures_failure() {
-        let runner = ProcessRunner::new(NoopNotifierFactory);
+    async fn process_runner_failure() {
         let spec = ExecSpec::from(&sample_task("false"));
-        let outcome = runner.run("fail-test", &spec).await.unwrap();
+        let outcome = ProcessRunner.run("t", &spec).await.unwrap();
         assert!(!outcome.is_success());
     }
 
     #[tokio::test]
     async fn process_runner_timeout() {
-        let runner = ProcessRunner::new(NoopNotifierFactory);
         let mut spec = ExecSpec::from(&sample_task("sleep"));
         spec.args = vec!["10".into()];
         spec.timeout_secs = 1;
-        let outcome = runner.run("timeout-test", &spec).await.unwrap();
-        assert!(!outcome.is_success());
+        let outcome = ProcessRunner.run("t", &spec).await.unwrap();
         assert_eq!(outcome.exit_code, -1);
     }
 
     #[tokio::test]
     async fn process_runner_spawn_error() {
-        let runner = ProcessRunner::new(NoopNotifierFactory);
         let spec = ExecSpec::from(&sample_task("/nonexistent/binary/xyz"));
-        let result = runner.run("bad-cmd", &spec).await;
+        let result = ProcessRunner.run("t", &spec).await;
         assert!(matches!(result, Err(TeikiError::Spawn { .. })));
     }
 
-    // ── run_with_notify tests ───────────────────────────────────
+    // ── MockRunner ─────────────────────────────────────────────
 
     #[tokio::test]
-    async fn run_with_notify_sends_on_failure() {
-        let factory = RecordingNotifierFactory::default();
-        let runner = ProcessRunner::new(factory.clone());
-        let mut task = sample_task("false");
-        task.notify_on_failure = Some("http://example.com/hook".into());
-        runner.run_with_notify("notify-test", &task).await.unwrap();
-        let calls = factory.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "http://example.com/hook");
-        assert_eq!(calls[0].1, "notify-test");
+    async fn mock_runner_records() {
+        let r = MockRunner::succeeding();
+        r.run("a", &echo_spec()).await.unwrap();
+        r.run("b", &echo_spec()).await.unwrap();
+        assert_eq!(*r.calls.lock().unwrap(), vec!["a", "b"]);
     }
 
     #[tokio::test]
-    async fn run_with_notify_silent_on_success() {
-        let factory = RecordingNotifierFactory::default();
-        let runner = ProcessRunner::new(factory.clone());
-        let mut task = sample_task("true");
-        task.notify_on_failure = Some("http://example.com/hook".into());
-        runner.run_with_notify("ok-test", &task).await.unwrap();
-        let calls = factory.calls.lock().unwrap();
-        assert!(calls.is_empty());
+    async fn mock_runner_failing() {
+        let r = MockRunner::failing(42);
+        let o = r.run("x", &echo_spec()).await.unwrap();
+        assert_eq!(o.exit_code, 42);
+    }
+
+    // ── RecordingNotifierFactory ────────────────────────────────
+
+    #[tokio::test]
+    async fn recording_notifier_captures() {
+        let n = RecordingNotifierFactory::default();
+        n.notify("http://a", "task-1", 1).await;
+        n.notify("http://b", "task-2", 2).await;
+        let calls = n.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "http://a");
+        assert_eq!(calls[1].2, 2);
     }
 
     #[tokio::test]
-    async fn run_with_notify_no_url_no_notify() {
-        let factory = RecordingNotifierFactory::default();
-        let runner = ProcessRunner::new(factory.clone());
-        let task = sample_task("false");
-        runner.run_with_notify("no-url", &task).await.unwrap();
-        let calls = factory.calls.lock().unwrap();
-        assert!(calls.is_empty());
-    }
-
-    // ── MockRunner tests ────────────────────────────────────────
-
-    #[tokio::test]
-    async fn mock_runner_records_calls() {
-        let runner = MockRunner::succeeding();
-        let spec = echo_spec();
-        runner.run("a", &spec).await.unwrap();
-        runner.run("b", &spec).await.unwrap();
-        let calls = runner.calls.lock().unwrap();
-        assert_eq!(*calls, vec!["a", "b"]);
-    }
-
-    #[tokio::test]
-    async fn mock_runner_failing_returns_code() {
-        let runner = MockRunner::failing(42);
-        let spec = echo_spec();
-        let outcome = runner.run("x", &spec).await.unwrap();
-        assert_eq!(outcome.exit_code, 42);
+    async fn noop_notifier() {
+        NoopNotifierFactory.notify("http://x", "t", 1).await;
     }
 }

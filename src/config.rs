@@ -218,11 +218,12 @@ fn default_platforms() -> Vec<Platform> { vec![Platform::Darwin, Platform::Linux
 
 // ── Tests ──────────────────────────────────────────────────────
 
-#[cfg(test)]
+// ── Test/mock types (public for downstream crate tests) ────────
+
 pub mod tests {
     use super::*;
 
-    /// In-memory config source for testing.
+    /// In-memory config source — inject any config without filesystem.
     pub struct StaticSource(pub Config);
 
     impl ConfigSource for StaticSource {
@@ -231,7 +232,7 @@ pub mod tests {
         }
     }
 
-    /// Failing config source for error-path testing.
+    /// Always-failing config source for error-path testing.
     pub struct FailingSource;
 
     impl ConfigSource for FailingSource {
@@ -240,6 +241,8 @@ pub mod tests {
         }
     }
 
+    /// Build a `TaskConfig` with sensible defaults for testing.
+    #[must_use]
     pub fn sample_task(command: &str) -> TaskConfig {
         TaskConfig {
             description: "test task".into(),
@@ -258,6 +261,7 @@ pub mod tests {
         }
     }
 
+    #[cfg(test)]
     fn sample_config() -> Config {
         let mut tasks = BTreeMap::new();
         tasks.insert("echo-test".into(), sample_task("echo"));

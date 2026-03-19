@@ -219,7 +219,7 @@ impl<C: ConfigSource, R: TaskRunner, N: NotifierFactory, P: PlatformDetector> Ap
 mod tests {
     use super::*;
     use crate::config::{Config, tests::{StaticSource, sample_task}};
-    use crate::executor::{NoopNotifierFactory, tests::MockRunner};
+    use crate::executor::{NoopNotifierFactory, MockRunner};
     use crate::platform::{Platform, tests::MockPlatform};
     use std::collections::BTreeMap;
 
@@ -451,7 +451,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_task_notifies_on_failure_with_correct_url() {
-        use crate::executor::tests::RecordingNotifierFactory;
+        use crate::executor::RecordingNotifierFactory;
         let factory = RecordingNotifierFactory::default();
         let mut cfg = test_config();
         cfg.tasks.get_mut("task-a").unwrap().notify_on_failure =
@@ -472,7 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_all_notifies_per_task_url() {
-        use crate::executor::tests::RecordingNotifierFactory;
+        use crate::executor::RecordingNotifierFactory;
         let factory = RecordingNotifierFactory::default();
         let mut cfg = test_config();
         cfg.tasks.get_mut("task-a").unwrap().notify_on_failure =

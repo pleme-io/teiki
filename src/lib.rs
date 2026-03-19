@@ -5,26 +5,12 @@
 //!
 //! # Traits
 //!
-//! | Trait | Purpose | Production | Mock |
+//! | Trait | Purpose | Production | Test |
 //! |---|---|---|---|
-//! | [`ConfigSource`] | Load config | [`ShikumiSource`] | `StaticSource` (in tests) |
-//! | [`TaskRunner`] | Execute tasks | [`ProcessRunner`] | `MockRunner` (in tests) |
-//! | [`NotifierFactory`] | Failure webhooks | [`HttpNotifierFactory`] | `RecordingNotifierFactory` (in tests) |
-//! | [`PlatformDetector`] | Detect OS | [`NativePlatform`] | `MockPlatform` (in tests) |
-//!
-//! # Quick Start
-//!
-//! ```ignore
-//! use teiki::{App, ShikumiSource, ProcessRunner, NoopNotifierFactory, NativePlatform};
-//!
-//! let app = App::new(
-//!     ShikumiSource::new(),
-//!     ProcessRunner::new(NoopNotifierFactory),
-//!     NoopNotifierFactory,
-//!     NativePlatform,
-//! );
-//! let outcome = app.run_task("my-task").await?;
-//! ```
+//! | [`ConfigSource`] | Load config | [`ShikumiSource`] | [`StaticSource`] |
+//! | [`TaskRunner`] | Execute tasks | [`ProcessRunner`] | [`MockRunner`] |
+//! | [`NotifierFactory`] | Failure webhooks | `HttpNotifierFactory` | [`RecordingNotifierFactory`] |
+//! | [`PlatformDetector`] | Detect OS | [`NativePlatform`] | [`MockPlatform`] |
 
 pub mod app;
 pub mod config;
@@ -33,13 +19,18 @@ pub mod executor;
 pub mod outcome;
 pub mod platform;
 
-// Re-export key types at crate root for ergonomic imports.
+// ── Production types ───────────────────────────────────────────
 pub use app::{App, TaskListEntry, ValidationResult};
 pub use config::{Config, ConfigSource, ShikumiSource, TaskConfig, TaskDefaults, Schedule};
 pub use error::{TeikiError, Result};
-pub use executor::{
-    ExecSpec, TaskRunner, NotifierFactory, ProcessRunner,
-    HttpNotifierFactory, NoopNotifierFactory, build_command,
-};
+pub use executor::{ExecSpec, TaskRunner, NotifierFactory, ProcessRunner, NoopNotifierFactory, build_command};
 pub use outcome::TaskOutcome;
 pub use platform::{Platform, PlatformDetector, NativePlatform};
+
+// ── Test/mock types (public — usable by downstream crates) ─────
+pub use config::tests::{StaticSource, FailingSource};
+pub use executor::{MockRunner, RecordingNotifierFactory};
+pub use platform::tests::MockPlatform;
+
+#[cfg(feature = "webhooks")]
+pub use executor::HttpNotifierFactory;

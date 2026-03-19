@@ -37,11 +37,12 @@ impl PlatformDetector for NativePlatform {
     }
 }
 
-#[cfg(test)]
+// ── Test/mock types (public for downstream crate tests) ────────
+
 pub mod tests {
     use super::*;
 
-    /// Mock platform detector for cross-platform test coverage.
+    /// Mock platform detector — inject any platform for testing.
     pub struct MockPlatform(pub Platform);
 
     impl PlatformDetector for MockPlatform {
@@ -49,6 +50,12 @@ pub mod tests {
             self.0
         }
     }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use tests::MockPlatform;
 
     #[test]
     fn display_darwin() {

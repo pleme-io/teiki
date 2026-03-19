@@ -58,9 +58,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Some(p) => ShikumiSource::with_path(p),
         None => ShikumiSource::new(),
     };
-    let notifier_factory = NoopNotifierFactory;
-    let runner = ProcessRunner::new(notifier_factory);
-    let app = App::new(config_source, runner, NoopNotifierFactory, NativePlatform);
+    let app = App::new(config_source, ProcessRunner, NoopNotifierFactory, NativePlatform);
 
     match cli.command {
         Command::Run { name } => app.run_task_exit(&name).await,
