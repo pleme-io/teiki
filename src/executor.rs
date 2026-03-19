@@ -1,91 +1,203 @@
 use crate::config::TaskConfig;
-use anyhow::{Context, Result};
-use std::process::ExitCode;
+use crate::notifier::Notifier;
+use crate::outcome::TaskOutcome;
 use std::time::Instant;
 use tracing::{error, info};
 
-/// Execute a single task by name
-pub async fn run_task(name: &str, task: &TaskConfig) -> Result<ExitCode> {
-    info!(task = name, command = %task.command, "starting task");
-    let start = Instant::now();
+/// Trait for executing tasks. Abstracted for mockability in tests.
+pub trait TaskRunner: Send + Sync {
+    fn run(
+        &self,
+        name: &str,
+        task: &TaskConfig,
+    ) -> impl std::future::Future<Output = anyhow::Result<TaskOutcome>> + Send;
+}
 
-    let mut cmd = tokio::process::Command::new(&task.command);
-    cmd.args(&task.args);
+/// Executes tasks as subprocesses via `tokio::process::Command`.
+pub struct ProcessRunner<N: Notifier> {
+    notifier: N,
+}
 
-    // Environment
-    for (k, v) in &task.env {
-        cmd.env(k, v);
+impl<N: Notifier> ProcessRunner<N> {
+    pub fn new(notifier: N) -> Self {
+        Self { notifier }
     }
 
-    // Extend PATH
-    if !task.extra_path.is_empty() {
-        let current_path = std::env::var("PATH").unwrap_or_default();
-        let new_path = format!("{}:{current_path}", task.extra_path.join(":"));
-        cmd.env("PATH", new_path);
+    fn build_command(task: &TaskConfig) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(&task.command);
+        cmd.args(&task.args);
+
+        for (k, v) in &task.env {
+            cmd.env(k, v);
+        }
+
+        if !task.extra_path.is_empty() {
+            let current = std::env::var("PATH").unwrap_or_default();
+            let extended = format!("{}:{current}", task.extra_path.join(":"));
+            cmd.env("PATH", extended);
+        }
+
+        if let Some(dir) = &task.working_directory {
+            cmd.current_dir(dir);
+        }
+
+        cmd
     }
+}
 
-    // Working directory
-    if let Some(dir) = &task.working_directory {
-        cmd.current_dir(dir);
-    }
+impl<N: Notifier> TaskRunner for ProcessRunner<N> {
+    async fn run(&self, name: &str, task: &TaskConfig) -> anyhow::Result<TaskOutcome> {
+        info!(task = name, command = %task.command, "starting");
+        let start = Instant::now();
+        let mut cmd = Self::build_command(task);
 
-    // Execute with optional timeout
-    let result = if task.timeout_secs > 0 {
-        let timeout = std::time::Duration::from_secs(task.timeout_secs);
-        match tokio::time::timeout(timeout, cmd.status()).await {
-            Ok(status) => status.context("spawning task"),
-            Err(_) => {
-                error!(
-                    task = name,
-                    timeout_secs = task.timeout_secs,
-                    "task timed out"
-                );
-                return Ok(ExitCode::FAILURE);
+        let status = if task.timeout_secs > 0 {
+            let timeout = std::time::Duration::from_secs(task.timeout_secs);
+            match tokio::time::timeout(timeout, cmd.status()).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    let elapsed = start.elapsed();
+                    error!(task = name, timeout_secs = task.timeout_secs, "timed out");
+                    self.notifier.notify(name, -1).await;
+                    return Ok(TaskOutcome::failure(name, -1, elapsed));
+                }
             }
-        }
-    } else {
-        cmd.status().await.context("spawning task")
-    };
+        } else {
+            cmd.status().await?
+        };
 
-    let elapsed = start.elapsed();
+        let elapsed = start.elapsed();
+        let code = status.code().unwrap_or(-1);
 
-    match result {
-        Ok(status) if status.success() => {
-            info!(
-                task = name,
-                elapsed_ms = elapsed.as_millis() as u64,
-                "task completed successfully"
-            );
-            Ok(ExitCode::SUCCESS)
-        }
-        Ok(status) => {
-            let code = status.code().unwrap_or(-1);
-            error!(
-                task = name,
-                exit_code = code,
-                elapsed_ms = elapsed.as_millis() as u64,
-                "task failed"
-            );
-            if let Some(url) = &task.notify_on_failure {
-                notify_failure(name, code, url).await;
+        if status.success() {
+            info!(task = name, elapsed_ms = elapsed.as_millis() as u64, "completed");
+            Ok(TaskOutcome::success(name, elapsed))
+        } else {
+            error!(task = name, exit_code = code, elapsed_ms = elapsed.as_millis() as u64, "failed");
+            if task.notify_on_failure.is_some() {
+                self.notifier.notify(name, code).await;
             }
-            Ok(ExitCode::FAILURE)
-        }
-        Err(e) => {
-            error!(task = name, error = %e, "failed to spawn task");
-            if let Some(url) = &task.notify_on_failure {
-                notify_failure(name, -1, url).await;
-            }
-            Err(e)
+            Ok(TaskOutcome::failure(name, code, elapsed))
         }
     }
 }
 
-/// Send failure notification via webhook (best-effort)
-async fn notify_failure(task_name: &str, exit_code: i32, webhook_url: &str) {
-    let body = serde_json::json!({
-        "text": format!("teiki task `{task_name}` failed (exit {exit_code})")
-    });
-    let client = reqwest::Client::new();
-    let _ = client.post(webhook_url).json(&body).send().await;
+// ── Tests ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+    use crate::config::tests::sample_task;
+    use crate::notifier::NoopNotifier;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Mock runner that records calls and returns predetermined outcomes.
+    pub struct MockRunner {
+        pub calls: Arc<Mutex<Vec<String>>>,
+        pub exit_code: i32,
+    }
+
+    impl MockRunner {
+        pub fn succeeding() -> Self {
+            Self { calls: Arc::new(Mutex::new(vec![])), exit_code: 0 }
+        }
+
+        pub fn failing(code: i32) -> Self {
+            Self { calls: Arc::new(Mutex::new(vec![])), exit_code: code }
+        }
+    }
+
+    impl TaskRunner for MockRunner {
+        async fn run(&self, name: &str, _task: &TaskConfig) -> anyhow::Result<TaskOutcome> {
+            self.calls.lock().unwrap().push(name.to_string());
+            if self.exit_code == 0 {
+                Ok(TaskOutcome::success(name, Duration::from_millis(1)))
+            } else {
+                Ok(TaskOutcome::failure(name, self.exit_code, Duration::from_millis(1)))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn process_runner_executes_echo() {
+        let runner = ProcessRunner::new(NoopNotifier);
+        let task = sample_task("echo");
+        let outcome = runner.run("echo-test", &task).await.unwrap();
+        assert!(outcome.is_success());
+    }
+
+    #[tokio::test]
+    async fn process_runner_captures_failure() {
+        let runner = ProcessRunner::new(NoopNotifier);
+        let task = sample_task("false");
+        let outcome = runner.run("fail-test", &task).await.unwrap();
+        assert!(!outcome.is_success());
+    }
+
+    #[tokio::test]
+    async fn process_runner_with_args() {
+        let runner = ProcessRunner::new(NoopNotifier);
+        let mut task = sample_task("echo");
+        task.args = vec!["hello".into(), "world".into()];
+        let outcome = runner.run("args-test", &task).await.unwrap();
+        assert!(outcome.is_success());
+    }
+
+    #[tokio::test]
+    async fn process_runner_with_env() {
+        let runner = ProcessRunner::new(NoopNotifier);
+        let mut task = sample_task("env");
+        task.env = BTreeMap::from([("TEIKI_TEST_VAR".into(), "1".into())]);
+        // env command just prints environment, should succeed
+        let outcome = runner.run("env-test", &task).await.unwrap();
+        assert!(outcome.is_success());
+    }
+
+    #[tokio::test]
+    async fn process_runner_timeout() {
+        let runner = ProcessRunner::new(NoopNotifier);
+        let mut task = sample_task("sleep");
+        task.args = vec!["10".into()];
+        task.timeout_secs = 1;
+        let outcome = runner.run("timeout-test", &task).await.unwrap();
+        assert!(!outcome.is_success());
+        assert_eq!(outcome.exit_code, -1);
+    }
+
+    #[tokio::test]
+    async fn process_runner_notifies_on_failure() {
+        use crate::notifier::tests::RecordingNotifier;
+        let notifier = RecordingNotifier::default();
+        let runner = ProcessRunner::new(notifier.clone());
+        let mut task = sample_task("false");
+        task.notify_on_failure = Some("http://example.com/hook".into());
+        let outcome = runner.run("notify-test", &task).await.unwrap();
+        assert!(!outcome.is_success());
+        let calls = notifier.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "notify-test");
+    }
+
+    #[tokio::test]
+    async fn process_runner_no_notify_without_url() {
+        use crate::notifier::tests::RecordingNotifier;
+        let notifier = RecordingNotifier::default();
+        let runner = ProcessRunner::new(notifier.clone());
+        let task = sample_task("false"); // no notify_on_failure
+        runner.run("no-notify", &task).await.unwrap();
+        let calls = notifier.calls.lock().unwrap();
+        assert!(calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mock_runner_records_calls() {
+        let runner = MockRunner::succeeding();
+        let task = sample_task("anything");
+        runner.run("a", &task).await.unwrap();
+        runner.run("b", &task).await.unwrap();
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(*calls, vec!["a", "b"]);
+    }
 }
