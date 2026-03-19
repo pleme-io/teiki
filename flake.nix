@@ -21,7 +21,9 @@
         version = "0.1.0";
         src = ./.;
         cargoLock.lockFile = ./Cargo.lock;
-        cargoLock.outputHashes = {};
+        cargoLock.outputHashes = {
+          "shikumi-0.1.0" = "sha256-i5jXXRJmAtmwQ9XXjT2rP59uu3rDg+nEl9PobCAbo60=";
+        };
         meta = {
           description = "Cross-platform scheduled task management";
           license = pkgs.lib.licenses.mit;
