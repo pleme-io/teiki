@@ -3,14 +3,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::error::TeikiError;
+
 /// Trait for loading configuration. Abstracted for testing.
 pub trait ConfigSource: Send + Sync {
     /// Load the full configuration.
     ///
     /// # Errors
     ///
-    /// Returns an error if the config file is missing or malformed.
-    fn load(&self) -> anyhow::Result<Config>;
+    /// Returns `TeikiError::ConfigNotFound` or `TeikiError::ConfigParse`.
+    fn load(&self) -> Result<Config, TeikiError>;
 }
 
 /// Loads config via shikumi discovery (production default).
@@ -37,16 +39,16 @@ impl Default for ShikumiSource {
 }
 
 impl ConfigSource for ShikumiSource {
-    fn load(&self) -> anyhow::Result<Config> {
+    fn load(&self) -> Result<Config, TeikiError> {
         let path = match &self.path_override {
             Some(p) => p.clone(),
             None => shikumi::ConfigDiscovery::new("teiki")
                 .env_override("TEIKI_CONFIG")
                 .discover()
-                .map_err(|e| anyhow::anyhow!("config not found: {e}"))?,
+                .map_err(|e| TeikiError::ConfigNotFound(e.to_string()))?,
         };
         let store = shikumi::ConfigStore::<Config>::load(&path, "TEIKI_")
-            .map_err(|e| anyhow::anyhow!("failed to load config from {}: {e}", path.display()))?;
+            .map_err(|e| TeikiError::ConfigParse(format!("{}: {e}", path.display())))?;
         Ok((*store.get().as_ref()).clone())
     }
 }
@@ -224,8 +226,17 @@ pub mod tests {
     pub struct StaticSource(pub Config);
 
     impl ConfigSource for StaticSource {
-        fn load(&self) -> anyhow::Result<Config> {
+        fn load(&self) -> Result<Config, crate::error::TeikiError> {
             Ok(self.0.clone())
+        }
+    }
+
+    /// Failing config source for error-path testing.
+    pub struct FailingSource;
+
+    impl ConfigSource for FailingSource {
+        fn load(&self) -> Result<Config, crate::error::TeikiError> {
+            Err(crate::error::TeikiError::ConfigNotFound("test failure".into()))
         }
     }
 

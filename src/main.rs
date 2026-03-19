@@ -1,12 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
-
-mod app;
-mod config;
-mod executor;
-mod notifier;
-mod outcome;
-mod platform;
+use teiki::{App, ShikumiSource, ProcessRunner, NoopNotifierFactory, NativePlatform};
 
 #[derive(Parser)]
 #[command(name = "teiki", version, about = "Cross-platform scheduled task management")]
@@ -60,23 +54,20 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
-    // Wire production dependencies
     let config_source = match cli.config {
-        Some(p) => config::ShikumiSource::with_path(p),
-        None => config::ShikumiSource::new(),
+        Some(p) => ShikumiSource::with_path(p),
+        None => ShikumiSource::new(),
     };
-    let runner = executor::ProcessRunner::new(notifier::NoopNotifier);
-    let platform = platform::NativePlatform;
-    let app = app::App::new(config_source, runner, platform);
+    let notifier_factory = NoopNotifierFactory;
+    let runner = ProcessRunner::new(notifier_factory);
+    let app = App::new(config_source, runner, NoopNotifierFactory, NativePlatform);
 
     match cli.command {
-        Command::Run { name } => app.run_task(&name).await,
-        Command::RunAll => app.run_all().await,
-        Command::List { current_platform, tag } => {
-            app.list(current_platform, tag.as_deref())
-        }
-        Command::Validate => app.validate(),
-        Command::Show => app.show(),
+        Command::Run { name } => app.run_task_exit(&name).await,
+        Command::RunAll => app.run_all_exit().await,
+        Command::List { current_platform, tag } => app.list_exit(current_platform, tag.as_deref()),
+        Command::Validate => app.validate_exit(),
+        Command::Show => app.show_exit(),
         Command::Init { output } => {
             let sample = include_str!("sample.yaml");
             match output {

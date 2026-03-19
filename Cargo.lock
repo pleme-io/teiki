@@ -1241,6 +1241,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "shikumi",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
