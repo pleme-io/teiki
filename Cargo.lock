@@ -1134,6 +1134,7 @@ dependencies = [
 [[package]]
 name = "shikumi"
 version = "0.1.0"
+source = "git+https://github.com/pleme-io/shikumi#a97c2185d7be127e966126dacdff80000ef5be7e"
 dependencies = [
  "arc-swap",
  "figment",
